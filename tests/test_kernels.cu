@@ -48,16 +48,18 @@ void test_gemv(tt::Rng& rng) {
             float* dx = to_device(x);
             float* dy = to_device(y0);
 
-            for (int accumulate = 0; accumulate <= 1; ++accumulate) {
-                std::vector<float> ref = y0;
-                cpu::matvec(hm, x.data(), ref.data(), accumulate != 0);
-                CUDA_CHECK(cudaMemcpy(dy, y0.data(), y0.size() * 4, cudaMemcpyHostToDevice));
-                gpu::gemv(dm, dx, dy, accumulate != 0, 0);
-                std::vector<float> got = to_host(dy, sh.rows);
-                char name[96];
-                std::snprintf(name, sizeof(name), "%s %5dx%-5d %s", quant_name(q), sh.rows, sh.cols,
-                              accumulate ? "(y+=Wx)" : "(y=Wx)");
-                tt::expect_close(name, got.data(), ref.data(), sh.rows, 1e-4);
+            for (int rpw : {1, 2, 4}) {
+                for (int accumulate = 0; accumulate <= 1; ++accumulate) {
+                    std::vector<float> ref = y0;
+                    cpu::matvec(hm, x.data(), ref.data(), accumulate != 0);
+                    CUDA_CHECK(cudaMemcpy(dy, y0.data(), y0.size() * 4, cudaMemcpyHostToDevice));
+                    gpu::gemv(dm, dx, dy, accumulate != 0, 0, rpw);
+                    std::vector<float> got = to_host(dy, sh.rows);
+                    char name[96];
+                    std::snprintf(name, sizeof(name), "%s %5dx%-5d R=%d %s", quant_name(q), sh.rows, sh.cols, rpw,
+                                  accumulate ? "(y+=Wx)" : "(y=Wx)");
+                    tt::expect_close(name, got.data(), ref.data(), sh.rows, 1e-4);
+                }
             }
             cudaFree((void*)dm.w);
             if (dm.scales) cudaFree((void*)dm.scales);
@@ -119,8 +121,12 @@ void test_rmsnorm_swiglu_embed(tt::Rng& rng) {
 
 void test_rope_attention(tt::Rng& rng) {
     std::printf("[rope + kv cache + attention]\n");
-    struct Cfg { int H, KV, D, ctx; };
-    for (Cfg c : {Cfg{32, 4, 64, 600}, Cfg{32, 32, 128, 300}, Cfg{8, 2, 256, 70}}) {
+    struct Cfg { int H, KV, D, ctx; bool split; };
+    const Cfg cfgs[] = {Cfg{32, 4, 64, 600, false},  Cfg{32, 32, 128, 300, false}, Cfg{8, 2, 256, 70, false},
+                        Cfg{32, 4, 64, 600, true},   Cfg{32, 32, 128, 300, true},  Cfg{8, 2, 256, 300, true},
+                        Cfg{12, 4, 128, 260, true},  Cfg{16, 16, 64, 129, true},   Cfg{32, 8, 128, 400, true}};
+    for (Cfg c : cfgs) {
+        if (c.split && !gpu::attention_split_supported(c.H, c.KV, c.D)) continue;
         const int kv_dim = c.KV * c.D;
         std::vector<uint16_t> kc_ref((size_t)c.ctx * kv_dim, 0), vc_ref((size_t)c.ctx * kv_dim, 0);
         __half* dkc = to_device(std::vector<__half>((size_t)c.ctx * kv_dim));
@@ -130,6 +136,7 @@ void test_rope_attention(tt::Rng& rng) {
         float* dv = to_device(std::vector<float>(kv_dim));
         float* dout = to_device(std::vector<float>(c.H * c.D));
         int* dpos = to_device(std::vector<int>{0});
+        float* dscratch = c.split ? to_device(std::vector<float>(gpu::attention_scratch_floats(c.H, c.D, c.ctx))) : nullptr;
         double worst_q = 0, worst_att = 0;
         bool cache_ok = true;
         for (int pos = 0; pos < c.ctx; ++pos) {
@@ -139,7 +146,7 @@ void test_rope_attention(tt::Rng& rng) {
             CUDA_CHECK(cudaMemcpy(dv, v.data(), v.size() * 4, cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaMemcpy(dpos, &pos, 4, cudaMemcpyHostToDevice));
             gpu::rope_kv(dq, dk, dv, dkc, dvc, dpos, c.H, c.KV, c.D, 10000.f, 0);
-            gpu::attention(dout, dq, dkc, dvc, dpos, c.H, c.KV, c.D, 0);
+            gpu::attention(dout, dq, dkc, dvc, dpos, c.H, c.KV, c.D, c.ctx, dscratch, 0);
 
             cpu::rope(q.data(), c.H, c.D, pos, 10000.f);
             cpu::rope(k.data(), c.KV, c.D, pos, 10000.f);
@@ -173,12 +180,14 @@ void test_rope_attention(tt::Rng& rng) {
             }
         }
         char name[96];
-        std::snprintf(name, sizeof(name), "H=%d KV=%d D=%d ctx=%d", c.H, c.KV, c.D, c.ctx);
+        std::snprintf(name, sizeof(name), "%s H=%d KV=%d D=%d ctx=%d", c.split ? "split" : "head ", c.H, c.KV, c.D,
+                      c.ctx);
         bool ok = worst_q < 5e-4 && worst_att < 5e-3 && cache_ok;
-        std::printf("  %-28s rope %.1e  attn %.1e  cache %s  %s\n", name, worst_q, worst_att, cache_ok ? "ok" : "BAD",
+        std::printf("  %-34s rope %.1e  attn %.1e  cache %s  %s\n", name, worst_q, worst_att, cache_ok ? "ok" : "BAD",
                     ok ? "ok" : "FAIL");
         if (!ok) ++tt::failures();
         cudaFree(dkc); cudaFree(dvc); cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dout); cudaFree(dpos);
+        if (dscratch) cudaFree(dscratch);
     }
 }
 

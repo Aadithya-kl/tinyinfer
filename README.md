@@ -69,8 +69,8 @@ token by about 3.8× compared with f16.
 
 | kernel | technique |
 |---|---|
-| `gemv<f16/q8/q4>` | One warp per output row. Each lane loads 16 B per step (8 halves, 16 int8 or 32 int4). `x` is held in shared memory at index `i + i/32`, which makes the 8-, 16- and 32-float lane strides bank-conflict-free. Each group's dot product is multiplied by its fp16 scale once. `y += Wx` is fused for the residual connections. |
-| `attention` | One block per query head, 8 warps that each take every 8th timestep. Each warp keeps a running max, sum and output vector (online softmax, the FlashAttention trick), and the 8 partial states are merged in shared memory at the end. K/V rows are read as coalesced `half2` vectors. Supports GQA/MQA and head_dim 64, 128 and 256. |
+| `gemv<f16/q8/q4, R>` | Each warp computes R rows (1, 2 or 4), so every lane keeps R independent 16-byte loads in flight (8 halves, 16 int8 or 32 int4 each). R is **autotuned per matrix shape when the model loads**. `x` is held in shared memory at index `i + i/32`, which makes the 8-, 16- and 32-float lane strides bank-conflict-free. Each group's dot product is multiplied by its fp16 scale once. `y += Wx` is fused for the residual connections. |
+| `attention` | **GQA-aware split-K flash-decoding.** There is one block per (KV head, 128-step chunk), and it serves every query head that shares that KV head, so each K/V row is read from memory once. Inside a block, 8 warps each keep online-softmax state (running max, sum, output) for all heads in the group. The warps are merged in shared memory, and a small combine kernel merges the chunks. The grid is sized from the KV-cache capacity and the position is read on the GPU, so the whole step stays inside one CUDA graph. A simpler one-block-per-head kernel remains as a fallback. Supports MHA/GQA/MQA and head_dim 64, 128 and 256. |
 | `rope_kv` | Applies HF-style `rotate_half` RoPE to q in place and to k, and writes the rotated k and v straight into the fp16 KV cache, all in one kernel. |
 | `rmsnorm`, `swiglu`, `embed`, `argmax` | Small fused element-wise and reduction kernels. `argmax` runs inside the CUDA graph, so greedy decoding copies back only 4 bytes per token. |
 
@@ -151,15 +151,33 @@ Run `tinyinfer --help` for all options: sampling (`-t`, `--top-p`, `--seed`), `-
 
 ## Benchmarks
 
-Decode throughput, measured with `--bench 256` (greedy, batch 1):
+Measured on an **RTX 3050 6 GB Laptop GPU** (sm_86, 20 SMs, 168 GB/s peak), Windows 11, CUDA 13.5.
 
-| GPU | model | quant | tok/s | weight GB/s | % of peak |
+**End-to-end decode** (`--bench 256`, greedy, batch 1, CUDA graph):
+
+| model | quant | tok/s | ms/token | weight bandwidth | version |
 |---|---|---|---|---|---|
-| RTX 3050 6 GB Laptop | TinyLlama-1.1B | f16 | *tbd* | | |
-| RTX 3050 6 GB Laptop | TinyLlama-1.1B | q8 | *tbd* | | |
-| RTX 3050 6 GB Laptop | TinyLlama-1.1B | q4 | *tbd* | | |
+| TinyLlama-1.1B-Chat | q4 (g64) | **200.7** | 4.98 | 110 GB/s (66% of peak) | v0.1 |
 
-Weights read per token for TinyLlama-1.1B: 2.07 GB (f16), 1.07 GB (q8), 0.55 GB (q4).
+For comparison, the f16 weights are 2.07 GB per token, which caps f16 at about 81 tok/s on this
+GPU. The q4 weights are 0.55 GB per token, a ceiling of about 305 tok/s.
+
+**GEMV kernels**, v0.1 (one row per warp), `tinf_bench_kernels`:
+
+| matrix (TinyLlama) | f16 | q8 | q4 |
+|---|---|---|---|
+| 2048×2048 (wq, wo) | 147 GB/s (88%) | 125 GB/s (74%) | 108 GB/s (64%) |
+| 5632×2048 (w1, w3) | 157 GB/s (93%) | 147 GB/s (87%) | 141 GB/s (84%) |
+| 2048×5632 (w2) | 140 GB/s (83%) | 116 GB/s (69%) | 91 GB/s (54%) |
+| 32000×2048 (lm_head) | 162 GB/s (97%) | 160 GB/s (95%) | 159 GB/s (95%) |
+
+These numbers motivated v0.2:
+- **Rows-per-warp GEMV with autotuning.** On short, wide matrices the 8-row blocks spend as much
+  traffic staging `x` as they spend reading weights.
+- **Split-K GQA attention.** The per-head kernel reaches only about 17 GB/s at 2048 context,
+  because each K/V row is re-read by all 8 query heads of its group.
+
+Run `tinf_bench_kernels` to see both versions side by side.
 
 ## Correctness
 
@@ -167,7 +185,7 @@ Weights read per token for TinyLlama-1.1B: 2.07 GB (f16), 1.07 GB (q8), 0.55 GB 
 |---|---|
 | model math vs HuggingFace | `tests/test_e2e.py` builds a random GQA Llama in `transformers`, converts it, and compares the logits at all 64 positions. Max relative error is about 8e-4 with 100% argmax agreement (f16, q8, q4, bf16). |
 | tokenizer vs HF | byte-identical token ids on Unicode, emoji, whitespace runs and byte-fallback cases |
-| CUDA kernels vs CPU | `tinf_tests`: gemv (3 formats × 7 shapes, including 32000×2048 and 333×11008), rmsnorm, swiglu, embed, argmax (with ties), RoPE + KV-cache writes, and attention up to 600 positions with GQA and head_dim 64/128/256 |
+| CUDA kernels vs CPU | `tinf_tests`: gemv (3 formats × 3 rows-per-warp × 7 shapes, including 32000×2048 and 333×11008), rmsnorm, swiglu, embed, argmax (with ties), RoPE + KV-cache writes, and both attention paths up to 600 positions (MHA, GQA with group sizes 3, 4 and 8, head_dim 64/128/256, contexts that cross chunk boundaries) |
 | whole engine, GPU vs CPU | `tinyinfer --verify N` on any model |
 | CI | GitHub Actions: CPU build + unit tests + end-to-end vs `transformers`, and a CUDA 13 compile for sm_75/86/89 |
 
@@ -190,10 +208,11 @@ docs/FORMAT.md       file format specification
 ## Roadmap
 
 - [ ] Batched prefill: a tiled tensor-core GEMM plus causal flash-attention, so prompts are processed in parallel
-- [ ] Split-K flash-decoding for long contexts (more blocks per head)
+- [x] Split-K flash-decoding for long contexts, GQA-aware (v0.2)
+- [x] GEMV rows-per-warp autotuning (v0.2)
 - [ ] Byte-level BPE tokenizer (Llama-3, Qwen2, Mistral-Nemo) and Llama-3 RoPE scaling
 - [ ] INT8 KV cache
-- [ ] Fused QKV and gate/up GEMVs, and autotuning of rows per block
+- [ ] Fused QKV and gate/up+SwiGLU GEMVs (fewer launches, x staged once)
 - [ ] Continuous batching and an OpenAI-compatible HTTP server
 
 ## License

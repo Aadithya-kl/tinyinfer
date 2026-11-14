@@ -109,6 +109,55 @@ def hf_reference_logits(model_dir, quant, group, ids):
     return out
 
 
+def check_real_tokenizer(binary, hf_dir):
+    """Chat template + tokenizer parity on a real model's tokenizer (weights are random, tiny)."""
+    import shutil
+    import torch
+    from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
+
+    tok = AutoTokenizer.from_pretrained(hf_dir)
+    failures = 0
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        for fn in ("tokenizer.json", "tokenizer_config.json"):
+            shutil.copy(os.path.join(hf_dir, fn), tmp)
+        cfg = LlamaConfig(vocab_size=len(tok), hidden_size=64, intermediate_size=64, num_hidden_layers=1,
+                          num_attention_heads=1, num_key_value_heads=1, bos_token_id=tok.bos_token_id,
+                          eos_token_id=tok.eos_token_id)
+        LlamaForCausalLM(cfg).to(torch.float32).save_pretrained(tmp, safe_serialization=True)
+        path = os.path.join(tmp, "t.tinf")
+        conv.convert(tmp, path, conv.Q_F16, 64, verbose=False)
+        pf = os.path.join(tmp, "p.txt")
+        for system, user in ((None, "hii"), ("You are a helpful assistant.", "What is CUDA?")):
+            msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": user}]
+            text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+            want = tok(text, add_special_tokens=True)["input_ids"]  # what HF pipelines feed the model
+            with open(pf, "w", encoding="utf-8", newline="") as f:
+                f.write(user)
+            cmd = [binary, "-m", path, "-q", "--tokenize-chat", "-f", pf] + (["-s", system] if system else [])
+            got = [int(t) for t in run(cmd).split()]
+            ok = got == want
+            failures += not ok
+            print(f"  real tokenizer chat template ({'with' if system else 'no'} system): {'ok' if ok else 'FAIL'}")
+            if not ok:
+                print(f"    hf  {want}\n    got {got}")
+        # raw text is compared with the canonical tokenizer.json via the `tokenizers` library
+        # (recent `transformers` wrappers re-tokenize runs of leading spaces slightly differently)
+        from tokenizers import Tokenizer as HFTokenizer
+        canon = HFTokenizer.from_file(os.path.join(hf_dir, "tokenizer.json"))
+        bad = 0
+        for text in TOKENIZER_TESTS:
+            with open(pf, "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+            got = [int(t) for t in run([binary, "-m", path, "-q", "--tokenize", "-f", pf]).split()]
+            if got != canon.encode(text, add_special_tokens=False).ids:
+                bad += 1
+                print(f"  real tokenizer mismatch: {text!r}")
+        failures += bad > 0
+        print(f"  real tokenizer raw parity: {len(TOKENIZER_TESTS) - bad}/{len(TOKENIZER_TESTS)}  "
+              f"{'ok' if bad == 0 else 'FAIL'}")
+    return failures
+
+
 def run(cmd):
     r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0:
@@ -121,6 +170,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", required=True, help="path to the tinyinfer executable")
     ap.add_argument("--gpu", action="store_true", help="test the CUDA engine instead of the CPU engine")
+    ap.add_argument("--hf-tokenizer", metavar="DIR",
+                    help="also check chat formatting + tokenization against a real HF tokenizer directory "
+                         "(e.g. a downloaded TinyLlama-1.1B-Chat snapshot)")
     args = ap.parse_args()
     engine_flag = [] if args.gpu else ["--cpu"]
     failures = 0
@@ -186,6 +238,9 @@ def main():
         # generation smoke test (greedy, chat template)
         out = run([args.bin, "-m", path, "-q", *engine_flag, "-p", "hello", "-t", "0", "-n", "8"])
         print(f"  generation smoke test: {len(out.strip())} chars  ok")
+
+    if args.hf_tokenizer:
+        failures += check_real_tokenizer(args.bin, args.hf_tokenizer)
 
     print("\nE2E: " + ("all tests passed" if failures == 0 else f"{failures} failure(s)"))
     return 1 if failures else 0

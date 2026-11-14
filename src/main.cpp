@@ -31,7 +31,7 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 
-const char* kVersion = "0.1.0";
+const char* kVersion = "0.2.0";
 
 struct Args {
     std::string model;
@@ -53,6 +53,7 @@ struct Args {
     std::string dump_logits;
     std::string tokens;
     bool tokenize = false;
+    bool tokenize_chat = false;
     bool quiet = false;
 };
 
@@ -79,6 +80,7 @@ void usage() {
         "      --bench N          decode N tokens greedily and report tokens/s and bandwidth\n"
         "      --verify N         run N tokens through GPU and CPU engines and compare logits\n"
         "      --tokenize         print the token ids of --prompt and exit\n"
+        "      --tokenize-chat    print the chat-formatted token ids of --prompt (+ --system) and exit\n"
         "      --tokens IDS       comma-separated token ids to use as input (testing)\n"
         "      --dump-logits FILE write float32 logits [T, vocab] for the input tokens and exit\n"
         "  -q, --quiet            no banner / stats\n"
@@ -119,6 +121,7 @@ Args parse_args(int argc, char** argv) {
         else if (s == "--bench") a.bench = std::stoi(need(i));
         else if (s == "--verify") a.verify = std::stoi(need(i));
         else if (s == "--tokenize") a.tokenize = true;
+        else if (s == "--tokenize-chat") a.tokenize_chat = true;
         else if (s == "--tokens") a.tokens = need(i);
         else if (s == "--dump-logits") a.dump_logits = need(i);
         else if (s == "-q" || s == "--quiet") a.quiet = true;
@@ -378,6 +381,13 @@ int run(int argc, char** argv) {
 
     if (a.tokenize) {
         auto ids = tok.encode(a.prompt, true);
+        for (size_t i = 0; i < ids.size(); ++i) std::printf(i ? " %d" : "%d", ids[i]);
+        std::printf("\n");
+        return 0;
+    }
+
+    if (a.tokenize_chat) {
+        auto ids = chat_turn(tok, resolve_template(a, c), a.system, a.prompt, true);
         for (size_t i = 0; i < ids.size(); ++i) std::printf(i ? " %d" : "%d", ids[i]);
         std::printf("\n");
         return 0;

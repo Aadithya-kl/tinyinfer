@@ -85,6 +85,9 @@ public:
         hb2_ = falloc(c.hidden_dim);
         logits_ = falloc(c.vocab_size);
         d_ints_ = static_cast<int*>(alloc(4 * sizeof(int)));  // [token, pos, argmax, pad]
+        if (gpu::attention_split_supported(c.n_heads, c.n_kv_heads, c.head_dim))
+            attn_scratch_ = falloc(gpu::attention_scratch_floats(c.n_heads, c.head_dim, ctx_));
+        tune_gemv();
 
         CUDA_CHECK(cudaMallocHost(&h_ints_, 4 * sizeof(int)));
         CUDA_CHECK(cudaMallocHost(&h_logits_, (size_t)c.vocab_size * sizeof(float)));
@@ -141,9 +144,14 @@ public:
     }
     std::string memory_summary() const override {
         char buf[160];
-        std::snprintf(buf, sizeof(buf), "VRAM: weights %.0f MiB + KV cache %.0f MiB (ctx %d, fp16)",
-                      weight_bytes_ / 1048576.0, kv_bytes_ / 1048576.0, ctx_);
-        return buf;
+        std::snprintf(buf, sizeof(buf), "VRAM: weights %.0f MiB + KV cache %.0f MiB (ctx %d, fp16) | attention: %s",
+                      weight_bytes_ / 1048576.0, kv_bytes_ / 1048576.0, ctx_,
+                      attn_scratch_ ? "split-K GQA" : "per-head");
+        std::string out = buf;
+        out += "\ngemv autotune (rows/warp):";
+        for (const Tuned& t : tuned_) out += " " + std::to_string(t.rows) + "x" + std::to_string(t.cols) + ":" +
+                                             std::to_string(t.rows_per_warp);
+        return out;
     }
 
 private:
@@ -208,6 +216,19 @@ private:
         return m;
     }
 
+    // Pick the fastest rows-per-warp variant for every distinct matrix shape (takes a few ms).
+    void tune_gemv() {
+        const Config& c = cfg_;
+        const size_t scratch_rows = std::max({(size_t)c.vocab_size, (size_t)c.hidden_dim, (size_t)c.q_dim(),
+                                              (size_t)c.dim});
+        float* y = falloc(scratch_rows);
+        float* x = falloc(std::max({c.dim, c.q_dim(), c.hidden_dim}));
+        const Layer& L = layers_[0];
+        for (const QMatrix* m : std::initializer_list<const QMatrix*>{&L.wq, &L.wk, &L.wo, &L.w1, &L.w2, &output_})
+            tuned_.push_back({m->rows, m->cols, gpu::autotune_gemv(*m, x, y, stream_)});
+        CUDA_CHECK(cudaStreamSynchronize(stream_));
+    }
+
     // All kernels of one decode step. Reads token/pos from d_ints_, so it is graph-capturable.
     void enqueue_step() {
         const Config& c = cfg_;
@@ -226,7 +247,7 @@ private:
             gpu::gemv(L.wk, xb_, k_, false, s);
             gpu::gemv(L.wv, xb_, v_, false, s);
             gpu::rope_kv(q_, k_, v_, kc, vc, d_pos, c.n_heads, c.n_kv_heads, c.head_dim, c.rope_theta, s);
-            gpu::attention(att_, q_, kc, vc, d_pos, c.n_heads, c.n_kv_heads, c.head_dim, s);
+            gpu::attention(att_, q_, kc, vc, d_pos, c.n_heads, c.n_kv_heads, c.head_dim, ctx_, attn_scratch_, s);
             gpu::gemv(L.wo, att_, x_, true, s);  // residual fused into the gemv epilogue
 
             gpu::rmsnorm(xb_, x_, L.ffn_norm, c.dim, c.norm_eps, s);
@@ -266,6 +287,9 @@ private:
     float *x_ = nullptr, *xb_ = nullptr, *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *att_ = nullptr;
     float *hb_ = nullptr, *hb2_ = nullptr, *logits_ = nullptr;
     int* d_ints_ = nullptr;
+    float* attn_scratch_ = nullptr;
+    struct Tuned { int rows, cols, rows_per_warp; };
+    std::vector<Tuned> tuned_;
     int* h_ints_ = nullptr;
     float* h_logits_ = nullptr;
     bool logits_valid_ = false;

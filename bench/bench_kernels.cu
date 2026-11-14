@@ -1,5 +1,6 @@
 // Kernel micro-benchmarks: achieved DRAM bandwidth of the gemv kernels (f16 / q8 / q4) on the
 // matrix shapes of TinyLlama-1.1B and Llama-2-7B, plus decode attention at several context lengths.
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -55,7 +56,7 @@ int main(int argc, char** argv) {
         {"tinyllama lm_head", 32000, 2048}, {"llama2-7b wq", 4096, 4096},  {"llama2-7b w1", 11008, 4096},
         {"llama2-7b w2", 4096, 11008},
     };
-    std::printf("%-20s %-12s %-5s %10s %10s %8s\n", "gemv", "shape", "quant", "time(us)", "GB/s", "%peak");
+    std::printf("%-20s %-12s %-5s %8s %8s %8s   %s\n", "gemv", "shape", "quant", "R=1", "R=2", "R=4", "best: time, GB/s, %peak");
     for (const Shape& s : shapes) {
         float* x = static_cast<float*>(dmalloc((size_t)s.cols * 4, 0));
         float* y = static_cast<float*>(dmalloc((size_t)s.rows * 4, 0));
@@ -69,11 +70,15 @@ int main(int argc, char** argv) {
             const size_t payload = q == Quant::F16 ? 2 * n_el : (q == Quant::Q8 ? n_el : n_el / 2);
             m.w = dmalloc(payload);
             if (q != Quant::F16) m.scales = static_cast<const uint16_t*>(dmalloc(2 * n_el / 64, 0));
-            const float ms = time_ms([&] { gpu::gemv(m, x, y, false, 0); }, iters);
+            float t[3];
+            const int rs[3] = {1, 2, 4};
+            for (int k = 0; k < 3; ++k) t[k] = time_ms([&] { gpu::gemv(m, x, y, false, 0, rs[k]); }, iters);
+            const float ms = std::min(t[0], std::min(t[1], t[2]));
             const double gbs = (double)m.bytes() / (ms * 1e-3) / 1e9;
             char shape[32];
             std::snprintf(shape, sizeof(shape), "%dx%d", s.rows, s.cols);
-            std::printf("%-20s %-12s %-5s %10.1f %10.1f %7.0f%%\n", s.what, shape, quant_name(q), ms * 1e3, gbs,
+            std::printf("%-20s %-12s %-5s %7.1fu %7.1fu %7.1fu   %6.1f us %6.1f GB/s %4.0f%%\n", s.what, shape,
+                        quant_name(q), t[0] * 1e3, t[1] * 1e3, t[2] * 1e3, ms * 1e3, gbs,
                         gi.peak_bandwidth_gbs > 0 ? 100.0 * gbs / gi.peak_bandwidth_gbs : 0.0);
             cudaFree((void*)m.w);
             if (m.scales) cudaFree((void*)m.scales);
@@ -82,7 +87,7 @@ int main(int argc, char** argv) {
         cudaFree(y);
     }
 
-    std::printf("\n%-20s %-12s %10s %10s\n", "attention", "ctx", "time(us)", "GB/s");
+    std::printf("\n%-20s %-6s %22s %22s\n", "attention", "ctx", "per-head: us  GB/s", "split-K GQA: us  GB/s");
     struct A { const char* what; int H, KV, D; };
     for (A a : {A{"tinyllama (32/4x64)", 32, 4, 64}, A{"llama2-7b (32x128)", 32, 32, 128}}) {
         for (int ctx : {128, 512, 2048}) {
@@ -94,9 +99,13 @@ int main(int argc, char** argv) {
             int* pos = static_cast<int*>(dmalloc(4, 0));
             int p = ctx - 1;
             CUDA_CHECK(cudaMemcpy(pos, &p, 4, cudaMemcpyHostToDevice));
-            const float ms = time_ms([&] { gpu::attention(o, q, kc, vc, pos, a.H, a.KV, a.D, 0); }, iters);
-            std::printf("%-20s %-12d %10.1f %10.1f\n", a.what, ctx, ms * 1e3, 2.0 * kv * 2 / (ms * 1e-3) / 1e9);
-            cudaFree(kc); cudaFree(vc); cudaFree(q); cudaFree(o); cudaFree(pos);
+            float* scratch = static_cast<float*>(dmalloc(gpu::attention_scratch_floats(a.H, a.D, ctx) * 4, 0));
+            const float ms1 = time_ms([&] { gpu::attention(o, q, kc, vc, pos, a.H, a.KV, a.D, ctx, nullptr, 0); }, iters);
+            const float ms2 = time_ms([&] { gpu::attention(o, q, kc, vc, pos, a.H, a.KV, a.D, ctx, scratch, 0); }, iters);
+            const double bytes = 2.0 * kv * 2;  // K + V, fp16, read once
+            std::printf("%-20s %-6d %10.1f %10.1f %11.1f %10.1f\n", a.what, ctx, ms1 * 1e3, bytes / (ms1 * 1e-3) / 1e9,
+                        ms2 * 1e3, bytes / (ms2 * 1e-3) / 1e9);
+            cudaFree(kc); cudaFree(vc); cudaFree(q); cudaFree(o); cudaFree(pos); cudaFree(scratch);
         }
     }
     return 0;
