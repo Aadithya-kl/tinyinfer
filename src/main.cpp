@@ -43,6 +43,7 @@ struct Args {
     int max_tokens = 256;
     float temperature = 0.7f;
     float top_p = 0.9f;
+    float min_p = 0.f;
     uint64_t seed = 0;
     int ctx = 0;
     bool cpu = false;
@@ -70,6 +71,7 @@ void usage() {
         "  -n, --max-tokens N     max new tokens per reply (default 256)\n"
         "  -t, --temperature F    sampling temperature, 0 = greedy (default 0.7)\n"
         "      --top-p F          nucleus sampling threshold (default 0.9)\n"
+        "      --min-p F          drop tokens with p < F * p(top token), 0 = off (default 0)\n"
         "      --seed N           RNG seed (default: time)\n"
         "  -c, --ctx N            KV-cache length (default min(2048, model max))\n\n"
         "engine:\n"
@@ -113,6 +115,7 @@ Args parse_args(int argc, char** argv) {
         else if (s == "-n" || s == "--max-tokens") a.max_tokens = std::stoi(need(i));
         else if (s == "-t" || s == "--temperature") a.temperature = std::stof(need(i));
         else if (s == "--top-p") a.top_p = std::stof(need(i));
+        else if (s == "--min-p") a.min_p = std::stof(need(i));
         else if (s == "--seed") a.seed = std::stoull(need(i));
         else if (s == "-c" || s == "--ctx") a.ctx = std::stoi(need(i));
         else if (s == "--cpu") a.cpu = true;
@@ -438,6 +441,7 @@ int run(int argc, char** argv) {
 
     uint64_t seed = a.seed ? a.seed : (uint64_t)std::chrono::system_clock::now().time_since_epoch().count();
     Sampler sampler(c.vocab_size, a.temperature, a.top_p, seed);
+    sampler.set_min_p(a.min_p);
     Session session(*eng, tok, sampler);
     const ChatTemplate tmpl = resolve_template(a, c);
 

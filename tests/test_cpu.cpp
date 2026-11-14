@@ -163,7 +163,15 @@ static void test_sampler() {
     int counts[4] = {0, 0, 0, 0};
     for (int i = 0; i < 4000; ++i) counts[s.sample(flat.data())]++;
     for (int c : counts) TT_CHECK(c > 850 && c < 1150);
-    std::printf("  greedy / nucleus / uniform                   %s\n", tt::failures() ? "FAIL" : "ok");
+    // min-p 0.5: p = {0.4, 0.3, 0.2, 0.1} -> only tokens 0 and 1 survive (0.3 >= 0.5 * 0.4)
+    std::vector<float> lp = {std::log(0.4f), std::log(0.3f), std::log(0.2f), std::log(0.1f)};
+    Sampler mp(4, 1.0f, 1.0f, 11);
+    mp.set_min_p(0.5f);
+    int mc[4] = {0, 0, 0, 0};
+    for (int i = 0; i < 7000; ++i) mc[mp.sample(lp.data())]++;
+    TT_CHECK(mc[2] == 0 && mc[3] == 0);
+    TT_CHECK(mc[0] > 3700 && mc[0] < 4300);  // 4/7 of 7000 = 4000
+    std::printf("  greedy / nucleus / uniform / min-p           %s\n", tt::failures() ? "FAIL" : "ok");
 }
 
 static void test_ops() {

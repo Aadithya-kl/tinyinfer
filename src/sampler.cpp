@@ -34,6 +34,16 @@ int Sampler::sample(const float* logits) {
         probs_[i] = std::exp((logits[i] - mx) / temperature_);
         sum += probs_[i];
     }
+    if (min_p_ > 0.f) {
+        // the most likely token has exp(0) = 1 before normalisation
+        const float thr = min_p_;
+        double kept = 0.0;
+        for (int i = 0; i < vocab_; ++i) {
+            if (probs_[i] < thr) probs_[i] = 0.f;
+            kept += probs_[i];
+        }
+        sum = kept;
+    }
     for (int i = 0; i < vocab_; ++i) probs_[i] = (float)(probs_[i] / sum);
 
     float r = next_float();
