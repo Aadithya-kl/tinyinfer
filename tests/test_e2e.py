@@ -241,6 +241,9 @@ def main():
         out = run([args.bin, "-m", path, "-q", *engine_flag, "-p", "hello", "-n", "8", "--seed", "1",
                    "--min-p", "0.05", "--repeat-penalty", "1.1", "--repeat-last-n", "16"])
         print(f"  sampling smoke test (min-p, repeat penalty): {len(out.strip())} chars  ok")
+        bench = json.loads(run([args.bin, "-m", path, "-q", *engine_flag, "--bench", "16", "--json"]))
+        assert bench["tokens"] > 0 and bench["tokens_per_s"] > 0, bench
+        print(f"  bench --json: {bench['tokens_per_s']:.0f} tok/s on {bench['engine']}  ok")
 
     if args.hf_tokenizer:
         failures += check_real_tokenizer(args.bin, args.hf_tokenizer)

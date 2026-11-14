@@ -156,7 +156,7 @@ The converter supports `LlamaForCausalLM` checkpoints that use a SentencePiece-B
 # plain text completion
 .\build\bin\tinyinfer.exe -m models/tinyllama-q4.tinf --raw -p "Once upon a time" -n 200
 
-# benchmark decode speed and achieved memory bandwidth
+# benchmark decode speed and achieved memory bandwidth (add --json for a machine-readable result)
 .\build\bin\tinyinfer.exe -m models/tinyllama-q4.tinf --bench 256
 
 # compare GPU vs CPU-reference logits on your model
@@ -166,7 +166,8 @@ The converter supports `LlamaForCausalLM` checkpoints that use a SentencePiece-B
 .\build\bin\tinf_bench_kernels.exe
 ```
 
-Run `tinyinfer --help` for all options: sampling (`-t`, `--top-p`, `--seed`), `--ctx`,
+Run `tinyinfer --help` for all options: sampling (`-t`, `--top-p`, `--min-p`, `--repeat-penalty`,
+`--repeat-last-n`, `--seed`), `--ctx`,
 `--system`, `--template`, `--no-graph`, `--cpu`, and the testing helpers `--tokenize`,
 `--tokens` and `--dump-logits`.
 

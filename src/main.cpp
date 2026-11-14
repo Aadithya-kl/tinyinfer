@@ -58,6 +58,7 @@ struct Args {
     bool tokenize = false;
     bool tokenize_chat = false;
     bool quiet = false;
+    bool json = false;
 };
 
 void usage() {
@@ -84,6 +85,7 @@ void usage() {
         "      --device N         CUDA device index (default 0)\n\n"
         "tools:\n"
         "      --bench N          decode N tokens greedily and report tokens/s and bandwidth\n"
+        "      --json             with --bench: print the result as one JSON object on stdout\n"
         "      --verify N         run N tokens through GPU and CPU engines and compare logits\n"
         "      --tokenize         print the token ids of --prompt and exit\n"
         "      --tokenize-chat    print the chat-formatted token ids of --prompt (+ --system) and exit\n"
@@ -134,6 +136,7 @@ Args parse_args(int argc, char** argv) {
         else if (s == "--tokens") a.tokens = need(i);
         else if (s == "--dump-logits") a.dump_logits = need(i);
         else if (s == "-q" || s == "--quiet") a.quiet = true;
+        else if (s == "--json") a.json = true;
         else if (s == "-h" || s == "--help") { usage(); std::exit(0); }
         else if (s == "--version") { std::printf("tinyinfer %s\n", kVersion); std::exit(0); }
         else throw std::runtime_error("unknown argument: " + s + "  (see --help)");
@@ -296,7 +299,24 @@ ChatTemplate resolve_template(const Args& a, const Config& c) {
 // ------------------------------------------------------------------------------------------------
 // modes
 // ------------------------------------------------------------------------------------------------
-int run_bench(Engine& eng, const Tokenizer& tok, int n) {
+std::string json_str(const std::string& v) {
+    std::string o = "\"";
+    for (unsigned char ch : v) {
+        if (ch == '"' || ch == '\\') {
+            o += '\\';
+            o += (char)ch;
+        } else if (ch < 0x20) {
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "\\u%04x", ch);
+            o += buf;
+        } else {
+            o += (char)ch;
+        }
+    }
+    return o + "\"";
+}
+
+int run_bench(Engine& eng, const Tokenizer& tok, int n, bool json) {
     const int warmup = 8;
     n = std::min(n, eng.context_length() - warmup - 2);
     if (n <= 0) throw std::runtime_error("context too small for benchmark");
@@ -310,19 +330,33 @@ int run_bench(Engine& eng, const Tokenizer& tok, int n) {
 
     const double tps = n / s;
     const double gb = (double)eng.weight_bytes_per_token() / 1e9;
+    std::string gpu_name;
+    double peak = 0.0;
+#ifdef TINF_WITH_CUDA
+    if (eng.name().rfind("cuda", 0) == 0) {
+        GpuInfo gi = gpu_info();
+        gpu_name = gi.name;
+        peak = gi.peak_bandwidth_gbs;
+    }
+#endif
+    if (json) {
+        const Config& c = eng.config();
+        std::printf("{\"version\": %s, \"engine\": %s, \"gpu\": %s, \"quant\": %s, \"dim\": %d, \"n_layers\": %d, "
+                    "\"vocab\": %d, \"weights_mb_per_token\": %.1f, \"tokens\": %d, \"seconds\": %.4f, "
+                    "\"tokens_per_s\": %.2f, \"ms_per_token\": %.3f, \"bandwidth_gbs\": %.1f, "
+                    "\"peak_bandwidth_gbs\": %.1f, \"pct_of_peak\": %.1f}\n",
+                    json_str(kVersion).c_str(), json_str(eng.name()).c_str(), json_str(gpu_name).c_str(),
+                    json_str(quant_name(c.quant)).c_str(), c.dim, c.n_layers, c.vocab_size, gb * 1e3, n, s, tps,
+                    1e3 / tps, gb * tps, peak, peak > 0 ? 100.0 * gb * tps / peak : 0.0);
+        return 0;
+    }
     std::printf("engine           : %s\n", eng.name().c_str());
     std::printf("weights / token  : %.1f MB\n", gb * 1e3);
     std::printf("decode           : %d tokens in %.3f s\n", n, s);
     std::printf("throughput       : %.1f tok/s  (%.2f ms/token)\n", tps, 1e3 / tps);
     std::printf("weight bandwidth : %.1f GB/s", gb * tps);
-#ifdef TINF_WITH_CUDA
-    if (eng.name().rfind("cuda", 0) == 0) {
-        GpuInfo gi = gpu_info();
-        if (gi.peak_bandwidth_gbs > 0)
-            std::printf("  (%.0f%% of %.0f GB/s peak on %s)", 100.0 * gb * tps / gi.peak_bandwidth_gbs,
-                        gi.peak_bandwidth_gbs, gi.name.c_str());
-    }
-#endif
+    if (peak > 0)
+        std::printf("  (%.0f%% of %.0f GB/s peak on %s)", 100.0 * gb * tps / peak, peak, gpu_name.c_str());
     std::printf("\n");
     return 0;
 }
@@ -446,7 +480,7 @@ int run(int argc, char** argv) {
         std::fprintf(stderr, "\n");
     }
 
-    if (a.bench > 0) return run_bench(*eng, tok, a.bench);
+    if (a.bench > 0) return run_bench(*eng, tok, a.bench, a.json);
 
     uint64_t seed = a.seed ? a.seed : (uint64_t)std::chrono::system_clock::now().time_since_epoch().count();
     Sampler sampler(c.vocab_size, a.temperature, a.top_p, seed);
