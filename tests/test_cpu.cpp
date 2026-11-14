@@ -172,6 +172,26 @@ static void test_sampler() {
     TT_CHECK(mc[2] == 0 && mc[3] == 0);
     TT_CHECK(mc[0] > 3700 && mc[0] < 4300);  // 4/7 of 7000 = 4000
     std::printf("  greedy / nucleus / uniform / min-p           %s\n", tt::failures() ? "FAIL" : "ok");
+    // repetition penalty: greedy picks token 0 until it is in the window, then token 1
+    std::vector<float> rl = {2.0f, 1.5f, -1.0f, -3.0f};
+    Sampler rp(4, 0.f, 1.0f, 1);
+    rp.set_repeat_penalty(1.5f, 2);
+    TT_CHECK(rp.needs_logits());
+    TT_CHECK(rp.sample(rl.data()) == 0);
+    rp.accept(0);
+    TT_CHECK(rp.sample(rl.data()) == 1);  // 2.0 / 1.5 = 1.33 < 1.5
+    rp.accept(1);
+    rp.accept(1);  // window of 2 now holds {1, 1}: token 0 is free again
+    TT_CHECK(rp.sample(rl.data()) == 0);
+    rp.reset_history();
+    rp.accept(0);
+    rp.accept(1);  // both penalised: 1.33 vs 1.0 -> 0
+    TT_CHECK(rp.sample(rl.data()) == 0);
+    TT_CHECK(rl[0] == 2.0f);  // caller's logits are not modified
+    Sampler off(4, 0.f, 1.0f, 1);
+    off.set_repeat_penalty(1.0f, 64);
+    TT_CHECK(!off.needs_logits());
+    std::printf("  repetition penalty                           %s\n", tt::failures() ? "FAIL" : "ok");
 }
 
 static void test_ops() {

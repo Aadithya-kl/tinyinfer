@@ -24,7 +24,37 @@ float Sampler::next_float() {  // xorshift64*
     return (float)(r >> 40) / 16777216.0f;
 }
 
+void Sampler::set_repeat_penalty(float penalty, int last_n) {
+    repeat_penalty_ = penalty;
+    repeat_last_n_ = last_n;
+    if (penalty_active()) {
+        penalized_.resize(vocab_);
+        seen_.assign(vocab_, 0);
+    }
+}
+
+void Sampler::accept(int token) {
+    if (!penalty_active()) return;
+    history_.push_back(token);
+    if ((int)history_.size() > 2 * repeat_last_n_)  // trim in batches
+        history_.erase(history_.begin(), history_.end() - repeat_last_n_);
+}
+
 int Sampler::sample(const float* logits) {
+    if (penalty_active() && !history_.empty()) {
+        std::copy(logits, logits + vocab_, penalized_.begin());
+        const size_t n = std::min(history_.size(), (size_t)repeat_last_n_);
+        for (size_t i = history_.size() - n; i < history_.size(); ++i) {
+            const int t = history_[i];
+            if (t < 0 || t >= vocab_ || seen_[t]) continue;
+            seen_[t] = 1;  // each distinct token is penalised once
+            float& l = penalized_[t];
+            l = l > 0.f ? l / repeat_penalty_ : l * repeat_penalty_;
+        }
+        for (size_t i = history_.size() - n; i < history_.size(); ++i)
+            if (history_[i] >= 0 && history_[i] < vocab_) seen_[history_[i]] = 0;
+        logits = penalized_.data();
+    }
     if (greedy()) return argmax(logits, vocab_);
 
     float mx = logits[0];

@@ -238,6 +238,9 @@ def main():
         # generation smoke test (greedy, chat template)
         out = run([args.bin, "-m", path, "-q", *engine_flag, "-p", "hello", "-t", "0", "-n", "8"])
         print(f"  generation smoke test: {len(out.strip())} chars  ok")
+        out = run([args.bin, "-m", path, "-q", *engine_flag, "-p", "hello", "-n", "8", "--seed", "1",
+                   "--min-p", "0.05", "--repeat-penalty", "1.1", "--repeat-last-n", "16"])
+        print(f"  sampling smoke test (min-p, repeat penalty): {len(out.strip())} chars  ok")
 
     if args.hf_tokenizer:
         failures += check_real_tokenizer(args.bin, args.hf_tokenizer)

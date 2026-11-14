@@ -44,6 +44,8 @@ struct Args {
     float temperature = 0.7f;
     float top_p = 0.9f;
     float min_p = 0.f;
+    float repeat_penalty = 1.f;
+    int repeat_last_n = 64;
     uint64_t seed = 0;
     int ctx = 0;
     bool cpu = false;
@@ -72,6 +74,8 @@ void usage() {
         "  -t, --temperature F    sampling temperature, 0 = greedy (default 0.7)\n"
         "      --top-p F          nucleus sampling threshold (default 0.9)\n"
         "      --min-p F          drop tokens with p < F * p(top token), 0 = off (default 0)\n"
+        "      --repeat-penalty F penalise tokens seen in the last --repeat-last-n tokens, 1 = off (default 1)\n"
+        "      --repeat-last-n N  window for --repeat-penalty (default 64)\n"
         "      --seed N           RNG seed (default: time)\n"
         "  -c, --ctx N            KV-cache length (default min(2048, model max))\n\n"
         "engine:\n"
@@ -116,6 +120,8 @@ Args parse_args(int argc, char** argv) {
         else if (s == "-t" || s == "--temperature") a.temperature = std::stof(need(i));
         else if (s == "--top-p") a.top_p = std::stof(need(i));
         else if (s == "--min-p") a.min_p = std::stof(need(i));
+        else if (s == "--repeat-penalty") a.repeat_penalty = std::stof(need(i));
+        else if (s == "--repeat-last-n") a.repeat_last_n = std::stoi(need(i));
         else if (s == "--seed") a.seed = std::stoull(need(i));
         else if (s == "-c" || s == "--ctx") a.ctx = std::stoi(need(i));
         else if (s == "--cpu") a.cpu = true;
@@ -181,6 +187,7 @@ public:
     void reset() {
         pos_ = 0;
         prev_ = -1;
+        sampler_.reset_history();
     }
 
     // Feed prompt tokens. Returns false if they do not fit in the context.
@@ -189,6 +196,7 @@ public:
         auto t0 = Clock::now();
         for (int t : toks) {
             eng_.forward(t, pos_++);
+            sampler_.accept(t);
             prev_ = t;
         }
         st.prompt_tokens += (int)toks.size();
@@ -201,7 +209,7 @@ public:
         auto t0 = Clock::now();
         int n = 0;
         while (n < max_tokens && pos_ < eng_.context_length()) {
-            int next = sampler_.greedy() ? eng_.argmax() : sampler_.sample(eng_.logits());
+            int next = sampler_.needs_logits() ? sampler_.sample(eng_.logits()) : eng_.argmax();
             if (next == tok_.eos()) break;
             if (print) {
                 std::string piece = tok_.decode(prev_, next);
@@ -210,6 +218,7 @@ public:
             }
             ++n;
             eng_.forward(next, pos_++);
+            sampler_.accept(next);
             prev_ = next;
         }
         if (pos_ >= eng_.context_length()) std::fprintf(stderr, "\n[context full]");
@@ -442,6 +451,7 @@ int run(int argc, char** argv) {
     uint64_t seed = a.seed ? a.seed : (uint64_t)std::chrono::system_clock::now().time_since_epoch().count();
     Sampler sampler(c.vocab_size, a.temperature, a.top_p, seed);
     sampler.set_min_p(a.min_p);
+    sampler.set_repeat_penalty(a.repeat_penalty, a.repeat_last_n);
     Session session(*eng, tok, sampler);
     const ChatTemplate tmpl = resolve_template(a, c);
 
