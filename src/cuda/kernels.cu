@@ -75,7 +75,7 @@ __global__ void __launch_bounds__(kGemvWarps* kWarp)
     float acc[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) acc[r] = 0.f;
-    const int ng = Q == 0 ? 1 : cols / group;
+    [[maybe_unused]] const int ng = Q == 0 ? 1 : cols / group;
 
     if constexpr (Q == 0) {
         const int nchunks = cols / 8;  // 8 halves per 16-byte chunk
@@ -307,117 +307,149 @@ __global__ void __launch_bounds__(kAttnWarps* kWarp)
 }
 
 // ------------------------------------------------------------------------------------------------
-// attention, main path: GQA-aware split-K flash-decoding.
-//   grid = (n_kv_heads, ceil(ctx / kAttnChunk)); block = 8 warps.
-//   A block owns one KV head and a 128-step slice of the timeline and serves all G query heads of
-//   that group, so every K/V row is read from DRAM exactly once (G=8 for TinyLlama / Llama-3).
-//   Each warp runs an online softmax over every 8th step; warps are merged in shared memory and the
-//   block writes an unnormalized partial (m, l, acc[HD]) per query head. attn_combine merges splits.
+// attention, main path: GQA-aware split-K flash-decoding with a shared-memory K/V tile.
+//   grid = (n_kv_heads, ceil(ctx / CH)); block = 8 warps.
+//   1. the block loads its CH-step K/V tile for one KV head into shared memory (read from DRAM once,
+//      shared by all G query heads of the group);
+//   2. each query head gets 8/GM warps; a warp scores its timesteps with ONE LANE PER TIMESTEP
+//      (no shuffle reductions per step; padded K rows make the column walk bank-conflict free),
+//      then needs just two warp reductions (max, sum) for the softmax of the whole tile;
+//   3. P·V with lanes over head dims (coalesced, conflict-free), warps of a head merged in smem,
+//      and the block writes an unnormalized partial (m, l, acc[HD]) that attn_combine merges.
 // ------------------------------------------------------------------------------------------------
-constexpr int kAttnChunk = 128;
+__host__ __device__ constexpr int attn_chunk(int hd) { return hd >= 256 ? 32 : 64; }
 
-template <int HD, int GM>  // GM = compile-time upper bound on the group size G
+__device__ __forceinline__ float warp_max(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+
+template <int HD, int GM>  // GM = power-of-two upper bound on the group size G
 __global__ void __launch_bounds__(kAttnWarps* kWarp)
     attn_split_kernel(float* __restrict__ part, const float* __restrict__ q, const __half* __restrict__ kc,
                       const __half* __restrict__ vc, const int* __restrict__ pos_p, int n_heads, int n_kv_heads,
                       int max_splits) {
+    constexpr int CH = attn_chunk(HD);
+    constexpr int H2 = HD / 2;          // half2 per row
+    constexpr int KS = H2 + 1;          // padded K row stride (odd -> lane-per-row reads hit distinct banks)
+    constexpr int WPH = kAttnWarps / GM;  // warps per query head
+    constexpr int TPW = CH / WPH;         // timesteps per warp
+    constexpr int NS = (TPW + kWarp - 1) / kWarp;
     constexpr int P = HD / 64;
-    __shared__ float sm_m[kAttnWarps][GM], sm_l[kAttnWarps][GM];
-    __shared__ float sm_acc[kAttnWarps][GM][HD];
+    __shared__ __half2 Ks[CH * KS];
+    __shared__ __half2 Vs[CH * H2];
+    __shared__ float qs[GM][HD];
+    __shared__ float ps[kAttnWarps][TPW];
+    __shared__ float sm_m[kAttnWarps], sm_l[kAttnWarps];
+    __shared__ float sm_acc[kAttnWarps][HD];
 
     const int kvh = blockIdx.x, split = blockIdx.y;
     const int pos = *pos_p;
-    const int t0 = split * kAttnChunk;
+    const int t0 = split * CH;
     if (t0 > pos) return;  // uniform for the whole block
-    const int t1 = min(t0 + kAttnChunk, pos + 1);
+    const int nt = min(CH, pos + 1 - t0);
     const int G = n_heads / n_kv_heads;
-    const int warp = threadIdx.x / kWarp, lane = threadIdx.x % kWarp;
-    const size_t stride2 = (size_t)n_kv_heads * HD / 2;  // cache row stride in half2
+
+    // 1. cooperative tile load (coalesced 4-byte accesses) + scaled queries
+    const size_t stride2 = (size_t)n_kv_heads * H2;
+    const __half2* kg = reinterpret_cast<const __half2*>(kc) + (size_t)t0 * stride2 + (size_t)kvh * H2;
+    const __half2* vg = reinterpret_cast<const __half2*>(vc) + (size_t)t0 * stride2 + (size_t)kvh * H2;
+    for (int i = threadIdx.x; i < nt * H2; i += blockDim.x) {
+        const int r = i / H2, c = i % H2;
+        Ks[r * KS + c] = kg[(size_t)r * stride2 + c];
+        Vs[r * H2 + c] = vg[(size_t)r * stride2 + c];
+    }
     const float scale = rsqrtf((float)HD);
-
-    float2 qv[GM][P];
-#pragma unroll
-    for (int g = 0; g < GM; ++g) {
-        const float* qh = q + (size_t)(kvh * G + min(g, G - 1)) * HD;
-#pragma unroll
-        for (int p = 0; p < P; ++p) {
-            const int d = 2 * (lane + kWarp * p);
-            qv[g][p] = make_float2(qh[d] * scale, qh[d + 1] * scale);
-        }
+    for (int i = threadIdx.x; i < GM * HD; i += blockDim.x) {
+        const int g = i / HD, d = i % HD;
+        qs[g][d] = g < G ? q[(size_t)(kvh * G + g) * HD + d] * scale : 0.f;
     }
-    float m[GM], l[GM];
-    float2 acc[GM][P];
-#pragma unroll
-    for (int g = 0; g < GM; ++g) {
-        m[g] = -INFINITY;
-        l[g] = 0.f;
-#pragma unroll
-        for (int p = 0; p < P; ++p) acc[g][p] = make_float2(0.f, 0.f);
-    }
+    __syncthreads();
 
-    const __half2* kb = reinterpret_cast<const __half2*>(kc) + (size_t)kvh * (HD / 2);
-    const __half2* vb = reinterpret_cast<const __half2*>(vc) + (size_t)kvh * (HD / 2);
-    for (int t = t0 + warp; t < t1; t += kAttnWarps) {
-        float2 kf[P], vf[P];
+    const int warp = threadIdx.x / kWarp, lane = threadIdx.x % kWarp;
+    const int g = warp / WPH, sub = warp % WPH;
+    const int tw = sub * TPW;  // first tile row of this warp
+    float m = -INFINITY, l = 0.f;
+    float2 acc[P];
 #pragma unroll
-        for (int p = 0; p < P; ++p) {
-            kf[p] = __half22float2(kb[(size_t)t * stride2 + lane + kWarp * p]);
-            vf[p] = __half22float2(vb[(size_t)t * stride2 + lane + kWarp * p]);
-        }
-        float sc[GM];
+    for (int p = 0; p < P; ++p) acc[p] = make_float2(0.f, 0.f);
+
+    if (g < G) {  // warp-uniform
+        // 2. scores: one lane per timestep
+        float sc[NS];
+        float mloc = -INFINITY;
 #pragma unroll
-        for (int g = 0; g < GM; ++g) {
-            float d = 0.f;
-#pragma unroll
-            for (int p = 0; p < P; ++p) d = fmaf(qv[g][p].x, kf[p].x, fmaf(qv[g][p].y, kf[p].y, d));
-            sc[g] = d;
-        }
-#pragma unroll
-        for (int g = 0; g < GM; ++g) {
-            if (g < G) {  // warp-uniform
-                const float sg = warp_sum(sc[g]);
-                const float m_new = fmaxf(m[g], sg);
-                const float corr = expf(m[g] - m_new);
-                const float pr = expf(sg - m_new);
-                l[g] = l[g] * corr + pr;
-#pragma unroll
-                for (int p = 0; p < P; ++p) {
-                    acc[g][p].x = fmaf(pr, vf[p].x, acc[g][p].x * corr);
-                    acc[g][p].y = fmaf(pr, vf[p].y, acc[g][p].y * corr);
+        for (int k = 0; k < NS; ++k) {
+            const int i = lane + kWarp * k;
+            const int t = tw + i;
+            float dot = -INFINITY;
+            if (i < TPW && t < nt) {
+                const __half2* kr = Ks + t * KS;
+                float a = 0.f;
+#pragma unroll 8
+                for (int c = 0; c < H2; ++c) {
+                    const float2 kf = __half22float2(kr[c]);
+                    a = fmaf(qs[g][2 * c], kf.x, fmaf(qs[g][2 * c + 1], kf.y, a));
                 }
-                m[g] = m_new;
+                dot = a;
+            }
+            sc[k] = dot;
+            mloc = fmaxf(mloc, dot);
+        }
+        m = warp_max(mloc);
+        if (m != -INFINITY) {
+            float lsum = 0.f;
+#pragma unroll
+            for (int k = 0; k < NS; ++k) {
+                const int i = lane + kWarp * k;
+                const float p = sc[k] == -INFINITY ? 0.f : expf(sc[k] - m);
+                if (i < TPW) ps[warp][i] = p;
+                lsum += p;
+            }
+            l = warp_sum(lsum);
+            __syncwarp();
+            // 3. acc = P V  (lanes over head dims)
+            const int n_mine = min(TPW, nt - tw);
+            for (int i = 0; i < n_mine; ++i) {
+                const float p = ps[warp][i];
+                const __half2* vr = Vs + (tw + i) * H2;
+#pragma unroll
+                for (int pp = 0; pp < P; ++pp) {
+                    const float2 vf = __half22float2(vr[lane + kWarp * pp]);
+                    acc[pp].x = fmaf(p, vf.x, acc[pp].x);
+                    acc[pp].y = fmaf(p, vf.y, acc[pp].y);
+                }
             }
         }
     }
 
+    if (lane == 0) {
+        sm_m[warp] = m;
+        sm_l[warp] = l;
+    }
 #pragma unroll
-    for (int g = 0; g < GM; ++g) {
-        if (lane == 0) {
-            sm_m[warp][g] = m[g];
-            sm_l[warp][g] = l[g];
-        }
-#pragma unroll
-        for (int p = 0; p < P; ++p) {
-            const int d = 2 * (lane + kWarp * p);
-            sm_acc[warp][g][d] = acc[g][p].x;
-            sm_acc[warp][g][d + 1] = acc[g][p].y;
-        }
+    for (int pp = 0; pp < P; ++pp) {
+        const int d = 2 * (lane + kWarp * pp);
+        sm_acc[warp][d] = acc[pp].x;
+        sm_acc[warp][d + 1] = acc[pp].y;
     }
     __syncthreads();
 
     for (int idx = threadIdx.x; idx < G * HD; idx += blockDim.x) {
-        const int g = idx / HD, d = idx % HD;
+        const int hg = idx / HD, d = idx % HD;
+        const int w0 = hg * WPH;
         float M = -INFINITY;
 #pragma unroll
-        for (int w = 0; w < kAttnWarps; ++w) M = fmaxf(M, sm_m[w][g]);
+        for (int w = 0; w < WPH; ++w) M = fmaxf(M, sm_m[w0 + w]);
         float L = 0.f, o = 0.f;
 #pragma unroll
-        for (int w = 0; w < kAttnWarps; ++w) {
-            const float f = (sm_m[w][g] == -INFINITY) ? 0.f : expf(sm_m[w][g] - M);
-            L = fmaf(sm_l[w][g], f, L);
-            o = fmaf(sm_acc[w][g][d], f, o);
+        for (int w = 0; w < WPH; ++w) {
+            const float f = (sm_m[w0 + w] == -INFINITY) ? 0.f : expf(sm_m[w0 + w] - M);
+            L = fmaf(sm_l[w0 + w], f, L);
+            o = fmaf(sm_acc[w0 + w][d], f, o);
         }
-        float* dst = part + ((size_t)(kvh * G + g) * max_splits + split) * (HD + 2);
+        float* dst = part + ((size_t)(kvh * G + hg) * max_splits + split) * (HD + 2);
         dst[2 + d] = o;
         if (d == 0) {
             dst[0] = M;
@@ -428,9 +460,9 @@ __global__ void __launch_bounds__(kAttnWarps* kWarp)
 
 // grid = n_heads, block = head_dim threads: merge the valid splits of one query head
 __global__ void attn_combine_kernel(float* __restrict__ out, const float* __restrict__ part,
-                                    const int* __restrict__ pos_p, int head_dim, int max_splits) {
+                                    const int* __restrict__ pos_p, int head_dim, int max_splits, int chunk) {
     const int h = blockIdx.x, d = threadIdx.x;
-    const int ns = *pos_p / kAttnChunk + 1;
+    const int ns = *pos_p / chunk + 1;
     const size_t stride = (size_t)head_dim + 2;
     const float* base = part + (size_t)h * max_splits * stride;
     float M = -INFINITY;
@@ -622,7 +654,8 @@ bool attention_split_supported(int n_heads, int n_kv_heads, int head_dim) {
 }
 
 size_t attention_scratch_floats(int n_heads, int head_dim, int ctx) {
-    const int max_splits = (ctx + kAttnChunk - 1) / kAttnChunk;
+    const int ch = attn_chunk(head_dim);
+    const int max_splits = (ctx + ch - 1) / ch;
     return (size_t)n_heads * max_splits * (head_dim + 2);
 }
 
@@ -630,7 +663,8 @@ void attention(float* out, const float* q, const __half* kc, const __half* vc, c
                int n_kv_heads, int head_dim, int ctx, float* scratch, cudaStream_t s) {
     const dim3 block(kAttnWarps * kWarp);
     if (scratch && attention_split_supported(n_heads, n_kv_heads, head_dim)) {
-        const int max_splits = (ctx + kAttnChunk - 1) / kAttnChunk;
+        const int ch = attn_chunk(head_dim);
+        const int max_splits = (ctx + ch - 1) / ch;
         const dim3 grid(n_kv_heads, max_splits);
         const int gm = group_bound(n_heads / n_kv_heads);
 #define TINF_SPLIT(HD, GM) attn_split_kernel<HD, GM><<<grid, block, 0, s>>>(scratch, q, kc, vc, pos, n_heads, n_kv_heads, max_splits)
@@ -650,7 +684,7 @@ void attention(float* out, const float* q, const __half* kc, const __half* vc, c
         }
 #undef TINF_SPLIT
         check_launch("attn_split");
-        attn_combine_kernel<<<n_heads, head_dim, 0, s>>>(out, scratch, pos, head_dim, max_splits);
+        attn_combine_kernel<<<n_heads, head_dim, 0, s>>>(out, scratch, pos, head_dim, max_splits, ch);
         check_launch("attn_combine");
         return;
     }

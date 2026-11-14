@@ -57,13 +57,11 @@ public:
             Layer& L = layers_[l];
             L.attn_norm = static_cast<float*>(upload(mf, p + "attention_norm"));
             L.ffn_norm = static_cast<float*>(upload(mf, p + "ffn_norm"));
-            L.wq = upload_matrix(mf, p + "wq");
-            L.wk = upload_matrix(mf, p + "wk");
-            L.wv = upload_matrix(mf, p + "wv");
+            // fused projections: [wq; wk; wv] -> one GEMV producing q|k|v, [w1; w3] -> gate|up
+            L.wqkv = upload_concat(mf, {p + "wq", p + "wk", p + "wv"});
             L.wo = upload_matrix(mf, p + "wo");
-            L.w1 = upload_matrix(mf, p + "w1");
+            L.w13 = upload_concat(mf, {p + "w1", p + "w3"});
             L.w2 = upload_matrix(mf, p + "w2");
-            L.w3 = upload_matrix(mf, p + "w3");
         }
         staging_.clear();
         staging_.shrink_to_fit();
@@ -77,12 +75,12 @@ public:
 
         x_ = falloc(c.dim);
         xb_ = falloc(std::max(c.dim, c.q_dim()));
-        q_ = falloc(c.q_dim());
-        k_ = falloc(c.kv_dim());
-        v_ = falloc(c.kv_dim());
+        q_ = falloc(c.q_dim() + 2 * (size_t)c.kv_dim());  // q | k | v, written by one fused GEMV
+        k_ = q_ + c.q_dim();
+        v_ = k_ + c.kv_dim();
         att_ = falloc(c.q_dim());
-        hb_ = falloc(c.hidden_dim);
-        hb2_ = falloc(c.hidden_dim);
+        hb_ = falloc(2 * (size_t)c.hidden_dim);  // gate | up
+        hb2_ = hb_ + c.hidden_dim;
         logits_ = falloc(c.vocab_size);
         d_ints_ = static_cast<int*>(alloc(4 * sizeof(int)));  // [token, pos, argmax, pad]
         if (gpu::attention_split_supported(c.n_heads, c.n_kv_heads, c.head_dim))
@@ -138,8 +136,7 @@ public:
     size_t weight_bytes_per_token() const override {
         size_t b = output_.bytes();
         for (const Layer& L : layers_)
-            b += L.wq.bytes() + L.wk.bytes() + L.wv.bytes() + L.wo.bytes() + L.w1.bytes() + L.w2.bytes() +
-                 L.w3.bytes();
+            b += L.wqkv.bytes() + L.wo.bytes() + L.w13.bytes() + L.w2.bytes();
         return b;
     }
     std::string memory_summary() const override {
@@ -158,7 +155,7 @@ private:
     struct Layer {
         float* attn_norm = nullptr;
         float* ffn_norm = nullptr;
-        QMatrix wq, wk, wv, wo, w1, w2, w3;
+        QMatrix wqkv, wo, w13, w2;
     };
 
     void validate() const {
@@ -219,14 +216,50 @@ private:
     // Pick the fastest rows-per-warp variant for every distinct matrix shape (takes a few ms).
     void tune_gemv() {
         const Config& c = cfg_;
-        const size_t scratch_rows = std::max({(size_t)c.vocab_size, (size_t)c.hidden_dim, (size_t)c.q_dim(),
-                                              (size_t)c.dim});
+        const size_t scratch_rows = std::max({(size_t)c.vocab_size, 2 * (size_t)c.hidden_dim,
+                                              (size_t)c.q_dim() + 2 * (size_t)c.kv_dim(), (size_t)c.dim});
         float* y = falloc(scratch_rows);
         float* x = falloc(std::max({c.dim, c.q_dim(), c.hidden_dim}));
         const Layer& L = layers_[0];
-        for (const QMatrix* m : std::initializer_list<const QMatrix*>{&L.wq, &L.wk, &L.wo, &L.w1, &L.w2, &output_})
+        for (const QMatrix* m : std::initializer_list<const QMatrix*>{&L.wqkv, &L.wo, &L.w13, &L.w2, &output_})
             tuned_.push_back({m->rows, m->cols, gpu::autotune_gemv(*m, x, y, stream_)});
         CUDA_CHECK(cudaStreamSynchronize(stream_));
+    }
+
+    // Upload several [rows_i, cols] matrices as one [sum rows_i, cols] matrix (rows concatenated;
+    // payload and per-group scales are both row-major, so they concatenate as plain bytes).
+    QMatrix upload_concat(const ModelFile& mf, std::initializer_list<std::string> names) {
+        QMatrix m;
+        m.quant = cfg_.quant;
+        m.group = cfg_.group_size;
+        size_t payload = 0, scales = 0;
+        for (const std::string& n : names) {
+            const TensorInfo& t = mf.tensor(n);
+            if (m.cols && m.cols != (int)t.shape[1]) throw std::runtime_error("concat: width mismatch at " + n);
+            m.cols = (int)t.shape[1];
+            m.rows += (int)t.shape[0];
+            payload += t.nbytes;
+            if (cfg_.quant != Quant::F16) scales += mf.tensor(n + ".scales").nbytes;
+        }
+        uint8_t* dw = static_cast<uint8_t*>(alloc(payload));
+        uint8_t* ds = scales ? static_cast<uint8_t*>(alloc(scales)) : nullptr;
+        size_t ow = 0, os = 0;
+        for (const std::string& n : names) {
+            const TensorInfo& t = mf.tensor(n);
+            mf.read(t, staging_.data());
+            CUDA_CHECK(cudaMemcpy(dw + ow, staging_.data(), t.nbytes, cudaMemcpyHostToDevice));
+            ow += t.nbytes;
+            if (ds) {
+                const TensorInfo& ts = mf.tensor(n + ".scales");
+                mf.read(ts, staging_.data());
+                CUDA_CHECK(cudaMemcpy(ds + os, staging_.data(), ts.nbytes, cudaMemcpyHostToDevice));
+                os += ts.nbytes;
+            }
+        }
+        weight_bytes_ += payload + scales;
+        m.w = dw;
+        m.scales = reinterpret_cast<const uint16_t*>(ds);
+        return m;
     }
 
     // All kernels of one decode step. Reads token/pos from d_ints_, so it is graph-capturable.
@@ -243,16 +276,13 @@ private:
             __half* kc = kcache_ + l * layer_cache;
             __half* vc = vcache_ + l * layer_cache;
             gpu::rmsnorm(xb_, x_, L.attn_norm, c.dim, c.norm_eps, s);
-            gpu::gemv(L.wq, xb_, q_, false, s);
-            gpu::gemv(L.wk, xb_, k_, false, s);
-            gpu::gemv(L.wv, xb_, v_, false, s);
+            gpu::gemv(L.wqkv, xb_, q_, false, s);  // q | k | v
             gpu::rope_kv(q_, k_, v_, kc, vc, d_pos, c.n_heads, c.n_kv_heads, c.head_dim, c.rope_theta, s);
             gpu::attention(att_, q_, kc, vc, d_pos, c.n_heads, c.n_kv_heads, c.head_dim, ctx_, attn_scratch_, s);
             gpu::gemv(L.wo, att_, x_, true, s);  // residual fused into the gemv epilogue
 
             gpu::rmsnorm(xb_, x_, L.ffn_norm, c.dim, c.norm_eps, s);
-            gpu::gemv(L.w1, xb_, hb_, false, s);
-            gpu::gemv(L.w3, xb_, hb2_, false, s);
+            gpu::gemv(L.w13, xb_, hb_, false, s);  // gate | up
             gpu::swiglu(hb_, hb2_, c.hidden_dim, s);
             gpu::gemv(L.w2, hb_, x_, true, s);
         }
