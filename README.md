@@ -70,7 +70,7 @@ token by about 3.8× compared with f16.
 | kernel | technique |
 |---|---|
 | `gemv<f16/q8/q4, R>` | Each warp computes R rows (1, 2 or 4), so every lane keeps R independent 16-byte loads in flight (8 halves, 16 int8 or 32 int4 each). R is **autotuned per matrix shape when the model loads**. `x` is held in shared memory at index `i + i/32`, which makes the 8-, 16- and 32-float lane strides bank-conflict-free. Each group's dot product is multiplied by its fp16 scale once. `y += Wx` is fused for the residual connections. |
-| `attention` | **GQA-aware split-K flash-decoding with a shared-memory tile.** There is one block per (KV head, 64-step chunk). The block copies its K/V tile into shared memory once, and that tile serves every query head sharing the KV head. Each head gets 8/G warps. A warp computes attention scores with **one lane per timestep**: padded K rows make this bank-conflict-free and need no shuffles, leaving just two warp reductions per tile for the softmax. P·V is computed with lanes spread over head dimensions, partial results are merged in shared memory, and a combine kernel merges the chunks. The grid is sized from the KV-cache capacity and the position is read on the GPU, so the whole step stays inside one CUDA graph. A simpler one-block-per-head kernel remains as a fallback. Supports MHA/GQA/MQA and head_dim 64, 128 and 256. |
+| `attention` | **GQA-aware split-K flash-decoding with a shared-memory tile.** There is one block per (KV head, 64-step chunk). The block copies its K/V tile into shared memory once, and that tile serves every query head sharing the KV head. Each head gets 8/G warps. A warp computes attention scores with **one lane per timestep**: padded K rows make this bank-conflict-free and need no shuffles, leaving just two warp reductions per tile for the softmax. P·V is computed with lanes spread over head dimensions, partial results are merged in shared memory, and a combine kernel merges the chunks. The grid is sized from the KV-cache capacity and the position is read on the GPU, so the whole step stays inside one CUDA graph. A simpler one-block-per-head kernel remains as a fallback. Used for GQA/MQA; plain MHA uses the per-head kernel, which measured faster. head_dim 64, 128 and 256. |
 | `rope_kv` | Applies HF-style `rotate_half` RoPE to q in place and to k, and writes the rotated k and v straight into the fp16 KV cache, all in one kernel. |
 | fused projections | `wq|wk|wv` and `w1|w3` are concatenated at load time, so each layer runs 2 large GEMVs instead of 5 small ones. This means fewer launches, a single staging of `x`, and no tiny 256-row matrices. |
 | `rmsnorm`, `swiglu`, `embed`, `argmax` | Small fused element-wise and reduction kernels. `argmax` runs inside the CUDA graph, so greedy decoding copies back only 4 bytes per token. |
@@ -160,7 +160,7 @@ Measured on an **RTX 3050 6 GB Laptop GPU** (sm_86, 20 SMs, 168 GB/s peak), Wind
 |---|---|---|---|
 | v0.1 | baseline kernels | 200.7 tok/s, 66% of peak | — |
 | v0.2 | autotuned multi-row GEMV, split-K GQA attention | **212.3 tok/s**, 69% of peak | 205.8 tok/s |
-| v0.3 | shared-memory-tiled attention, fused QKV and gate/up GEMVs | *pending measurement* | |
+| v0.3 | shared-memory-tiled attention, fused QKV and gate/up GEMVs | **235.2 tok/s**, 77% of peak | **224.7 tok/s** |
 
 "% of peak" counts only weight bytes (0.55 GB per token for q4), so the ceiling on this GPU is
 about 305 tok/s. For comparison, f16 weights are 2.07 GB per token, which caps f16 at about 81 tok/s.
@@ -180,12 +180,19 @@ about 305 tok/s. For comparison, f16 weights are 2.07 GB per token, which caps f
 
 | context | v0.1 per-head | v0.2 split-K GQA | v0.3 tiled |
 |---|---|---|---|
-| 128 | 10.1 µs | 26.2 µs | *pending* |
-| 2048 | 124.9 µs | **57.7 µs** | *pending* |
+| 128 | 8.0 µs | 26.2 µs | 12.6 µs |
+| 512 | 18.0 µs | 26.5 µs | 17.2 µs |
+| 2048 | 124.6 µs | 57.7 µs | **34.2 µs (3.6×)** |
 
 In v0.2, split-K stopped re-reading K/V for every head in a group, but each warp still did 8
 dependent warp reductions per timestep, so short contexts got slower. v0.3 removes that cost by
 scoring with one lane per timestep from a shared-memory tile.
+
+Models without grouped-query attention, such as Llama-2-7B (one KV head per query head), get no
+benefit from sharing the K/V tile. On this GPU the per-head kernel is faster for them (219 µs vs
+269 µs at 2048 context), so the engine uses split-K only when the group size is at least 2.
+
+Overall, v0.1 → v0.3 gives **+17% decode throughput**, and the gap grows at long context.
 
 ## Correctness
 

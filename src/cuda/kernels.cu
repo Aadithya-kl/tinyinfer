@@ -647,6 +647,9 @@ int group_bound(int g) { return g <= 1 ? 1 : g <= 2 ? 2 : g <= 4 ? 4 : g <= 8 ? 
 
 bool attention_split_supported(int n_heads, int n_kv_heads, int head_dim) {
     if (n_kv_heads <= 0 || n_heads % n_kv_heads) return false;
+    // Without grouping (G=1, plain MHA) there is no K/V reuse to exploit; measured on an RTX 3050 the
+    // per-head kernel is faster there (219 vs 269 us at ctx 2048), so split-K is used for GQA/MQA only.
+    if (n_heads == n_kv_heads) return false;
     const int gm = group_bound(n_heads / n_kv_heads);
     if (gm == 0) return false;
     if (head_dim != 64 && head_dim != 128 && head_dim != 256) return false;
