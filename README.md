@@ -1,4 +1,4 @@
-# tinyinfer
+# Tinyinfer
 
 **A from-scratch CUDA inference engine for Llama-family LLMs. Hand-written kernels, INT4/INT8 weight quantization, CUDA-graph decoding. No PyTorch, no cuBLAS, no dependencies.**
 
@@ -9,11 +9,11 @@
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
 <p align="center">
-  <img src="docs/demo.svg" alt="tinyinfer decoding at 235 tok/s on an RTX 3050 Laptop GPU and passing GPU-vs-CPU verification" width="900">
+  <img src="docs/demo.svg" alt="Tinyinfer decoding at 235 tok/s on an RTX 3050 Laptop GPU and passing GPU-vs-CPU verification" width="900">
   <br><sub>Real output recorded on an RTX 3050 6 GB Laptop GPU: <b>235 tok/s</b>, 77% of peak memory bandwidth, logits verified against the CPU reference.</sub>
 </p>
 
-tinyinfer runs chat models such as TinyLlama-1.1B, Llama-2-7B and Vicuna on a laptop GPU. It is
+Tinyinfer runs chat models such as TinyLlama-1.1B, Llama-2-7B and Vicuna on a laptop GPU. It is
 small enough to read in an afternoon: the engine is about 2,200 lines of C++/CUDA. Every kernel on
 the hot path is written by hand and checked against a CPU reference, and that reference is in turn
 checked against HuggingFace `transformers`.
