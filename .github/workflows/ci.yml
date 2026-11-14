@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  cpu-and-e2e:
+    name: CPU build + unit tests + end-to-end vs HF transformers
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Python deps
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy transformers tokenizers safetensors
+      - name: Configure & build (CPU only)
+        run: |
+          cmake -S . -B build -DTINF_CUDA=OFF -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure
+      - name: End-to-end test (logits vs transformers, tokenizer parity)
+        run: python tests/test_e2e.py --bin build/bin/tinyinfer
+
+  cuda-build:
+    name: CUDA ${{ matrix.cuda }} compile (sm_75/86/89)
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        cuda: ["13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install CUDA toolkit (nvcc + cudart from PyPI)
+        run: |
+          pip install "nvidia-cuda-nvcc==${{ matrix.cuda }}.*" "nvidia-cuda-runtime==${{ matrix.cuda }}.*" "nvidia-cuda-cccl==${{ matrix.cuda }}.*"
+          CUDA_ROOT=$(python -c "import nvidia, os; print([os.path.join(p, 'cu${{ matrix.cuda }}') for p in nvidia.__path__ if os.path.isdir(os.path.join(p, 'cu${{ matrix.cuda }}'))][0])")
+          ln -sf libcudart.so.${{ matrix.cuda }} "$CUDA_ROOT/lib/libcudart.so"
+          ln -sfn lib "$CUDA_ROOT/lib64"
+          echo "CUDA_ROOT=$CUDA_ROOT" >> "$GITHUB_ENV"
+          echo "$CUDA_ROOT/bin" >> "$GITHUB_PATH"
+      - name: Configure & build
+        run: |
+          nvcc --version
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCUDAToolkit_ROOT="$CUDA_ROOT" \
+                -DCMAKE_CUDA_COMPILER="$CUDA_ROOT/bin/nvcc" -DCMAKE_CUDA_ARCHITECTURES="75;86;89"
+          cmake --build build -j
+      - name: CPU unit tests (GPU tests need a GPU runner)
+        run: ctest --test-dir build -LE gpu --output-on-failure

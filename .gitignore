@@ -1,0 +1,14 @@
+build*/
+out/
+models/
+*.tinf
+*.tinf.tmp
+*.bin
+__pycache__/
+*.pyc
+.venv/
+.vs/
+.vscode/
+CMakeUserPresets.json
+*.nsys-rep
+*.ncu-rep

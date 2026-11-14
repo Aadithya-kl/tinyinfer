@@ -1,0 +1,7 @@
+# model conversion
+numpy>=1.24
+huggingface_hub>=0.20
+# end-to-end tests only (tests/test_e2e.py)
+# torch
+# transformers
+# tokenizers

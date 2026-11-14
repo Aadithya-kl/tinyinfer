@@ -1,0 +1,201 @@
+# tinyinfer
+
+**A from-scratch CUDA inference engine for Llama-family LLMs. Hand-written kernels, INT4/INT8 weight quantization, CUDA-graph decoding. No PyTorch, no cuBLAS, no dependencies.**
+
+[![CI](https://github.com/Aadithya-kl/tinyinfer/actions/workflows/ci.yml/badge.svg)](https://github.com/Aadithya-kl/tinyinfer/actions/workflows/ci.yml)
+![CUDA](https://img.shields.io/badge/CUDA-12%20%7C%2013-76B900)
+![C++17](https://img.shields.io/badge/C%2B%2B-17-blue)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
+
+tinyinfer runs real chat models (TinyLlama-1.1B, Llama-2-7B, Vicuna, ...) on a laptop GPU. It is
+small enough to read in an afternoon: the engine is about 2,200 lines of C++/CUDA. Every kernel on the hot path
+is written by hand and checked against a CPU reference. That reference is in turn checked against
+HuggingFace `transformers`.
+
+## Highlights
+
+- **Hand-written CUDA kernels.** GEMV in f16/q8/q4, RMSNorm, fused RoPE + KV-cache write,
+  single-pass flash-decoding attention with online softmax and GQA, SwiGLU, and on-device argmax.
+- **Weight-only quantization.** Group-wise INT8 and INT4 (group 64, fp16 scales) are dequantized
+  inside the GEMV, so 4-bit weights are never expanded in memory. TinyLlama-1.1B fits in about
+  0.7 GB and Llama-2-7B in about 3.8 GB, so both run on a 6 GB laptop GPU.
+- **Bandwidth-oriented GEMV.**
+  - One warp per row with fully coalesced 128-bit weight loads.
+  - The activation vector is staged in shared memory using a padded, bank-conflict-free layout.
+  - int8/int4 values are turned into floats with the 2²³ exponent trick (a bitwise OR plus a
+    float add) instead of slower `I2F` conversion instructions.
+  - The residual add is fused into the epilogue.
+- **CUDA Graphs.** A whole decode step (about 250 kernel launches) is captured once and replayed
+  for every token. The token and position are read from device memory, so the graph never needs
+  re-instantiating.
+- **Verified correctness.**
+  - Final logits match `transformers.LlamaForCausalLM` within 1e-3 relative error, with 100%
+    argmax agreement, for f16, q8, q4 and bf16 checkpoints.
+  - Tokenizer output is identical to HF `tokenizers`.
+  - Every CUDA kernel is unit-tested against the CPU reference.
+  - `--verify` compares the GPU and CPU engines on your own model.
+- **One self-contained file format** (`.tinf`) holding config, tokenizer and weights, produced by a
+  numpy-only converter that reads `.safetensors` directly.
+- **Cross-platform.** Windows (MSVC) and Linux (GCC), CUDA 12 and 13, GPUs from sm_75 (Turing) up.
+
+## How it works
+
+```mermaid
+flowchart LR
+    A[token id] --> E[embed f16→f32]
+    E --> L{{"× n_layers"}}
+    subgraph layer [decoder layer]
+      N1[RMSNorm] --> QKV[GEMV q/k/v<br/>f16·q8·q4]
+      QKV --> R[RoPE + write K,V<br/>to fp16 cache]
+      R --> AT[flash-decoding<br/>attention, GQA]
+      AT --> O[GEMV o + residual]
+      O --> N2[RMSNorm] --> GU[GEMV gate, up]
+      GU --> S[SwiGLU] --> D[GEMV down + residual]
+    end
+    L --> layer --> F[RMSNorm → GEMV lm_head] --> AM[argmax / sample]
+```
+
+During decoding each weight is read exactly once per generated token, so speed is limited by
+memory bandwidth:
+
+```
+tokens/s  ≤  DRAM bandwidth / bytes of weights per token
+```
+
+The design goal is to get as close to that ceiling as possible. 4-bit weights cut the bytes per
+token by about 3.8× compared with f16.
+
+### Kernel notes
+
+| kernel | technique |
+|---|---|
+| `gemv<f16/q8/q4>` | One warp per output row. Each lane loads 16 B per step (8 halves, 16 int8 or 32 int4). `x` is held in shared memory at index `i + i/32`, which makes the 8-, 16- and 32-float lane strides bank-conflict-free. Each group's dot product is multiplied by its fp16 scale once. `y += Wx` is fused for the residual connections. |
+| `attention` | One block per query head, 8 warps that each take every 8th timestep. Each warp keeps a running max, sum and output vector (online softmax, the FlashAttention trick), and the 8 partial states are merged in shared memory at the end. K/V rows are read as coalesced `half2` vectors. Supports GQA/MQA and head_dim 64, 128 and 256. |
+| `rope_kv` | Applies HF-style `rotate_half` RoPE to q in place and to k, and writes the rotated k and v straight into the fp16 KV cache, all in one kernel. |
+| `rmsnorm`, `swiglu`, `embed`, `argmax` | Small fused element-wise and reduction kernels. `argmax` runs inside the CUDA graph, so greedy decoding copies back only 4 bytes per token. |
+
+## Quick start
+
+### Requirements
+
+- An NVIDIA GPU, Turing or newer (GTX 16xx / RTX 20xx and up), with a recent driver
+- CUDA Toolkit 12.x or 13.x
+- CMake ≥ 3.24 and a C++17 compiler: Visual Studio 2022 Build Tools ("Desktop development with C++") on Windows, or GCC 11+ on Linux
+- Python 3.10+ with `numpy` and `huggingface_hub`, for converting models
+
+### Build
+
+```powershell
+git clone https://github.com/Aadithya-kl/tinyinfer
+cd tinyinfer
+cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=86     # 86 = RTX 30xx; use 75/89/... for your GPU, or omit for "native"
+cmake --build build --config Release -j
+```
+
+Binaries are placed in `build/bin/`.
+
+> **Windows tip:** if CMake reports *"No CUDA toolset found"*, the CUDA installer did not add
+> its Visual Studio integration. Re-run the CUDA installer after Visual Studio is installed, or
+> build from the *x64 Native Tools Command Prompt for VS 2022* with `-G Ninja`.
+
+### Test the kernels on your GPU
+
+```powershell
+.\build\bin\tinf_tests.exe          # every CUDA kernel vs the CPU reference
+.\build\bin\tinf_cpu_tests.exe      # fp16, quantization, tokenizer, sampler
+```
+
+### Get a model
+
+```powershell
+pip install -r tools/requirements.txt
+python tools/convert_hf.py --hf TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4 --out models/tinyllama-q4.tinf
+```
+
+| model | `--quant` | file size | notes |
+|---|---|---|---|
+| TinyLlama/TinyLlama-1.1B-Chat-v1.0 | f16 | 2.2 GB | reference quality |
+| TinyLlama/TinyLlama-1.1B-Chat-v1.0 | q8 | 1.2 GB | |
+| TinyLlama/TinyLlama-1.1B-Chat-v1.0 | q4 | 0.68 GB | fastest |
+| NousResearch/Llama-2-7b-chat-hf | q4 | 3.8 GB | fits a 6 GB GPU with `--ctx 1024 --template llama2` |
+| lmsys/vicuna-7b-v1.5 | q4 | 3.8 GB | |
+
+The converter supports `LlamaForCausalLM` checkpoints that use a SentencePiece-BPE tokenizer
+(the Llama-2 family) and are stored as F32, F16 or BF16 safetensors.
+
+### Run
+
+```powershell
+# interactive chat (uses the chat template stored in the model file)
+.\build\bin\tinyinfer.exe -m models/tinyllama-q4.tinf
+
+# one-shot prompt, greedy
+.\build\bin\tinyinfer.exe -m models/tinyllama-q4.tinf -p "Explain CUDA warps in two sentences." -t 0
+
+# plain text completion
+.\build\bin\tinyinfer.exe -m models/tinyllama-q4.tinf --raw -p "Once upon a time" -n 200
+
+# benchmark decode speed and achieved memory bandwidth
+.\build\bin\tinyinfer.exe -m models/tinyllama-q4.tinf --bench 256
+
+# compare GPU vs CPU-reference logits on your model
+.\build\bin\tinyinfer.exe -m models/tinyllama-q4.tinf --verify 16
+
+# kernel micro-benchmarks (GB/s per kernel and shape)
+.\build\bin\tinf_bench_kernels.exe
+```
+
+Run `tinyinfer --help` for all options: sampling (`-t`, `--top-p`, `--seed`), `--ctx`,
+`--system`, `--template`, `--no-graph`, `--cpu`, and the testing helpers `--tokenize`,
+`--tokens` and `--dump-logits`.
+
+## Benchmarks
+
+Decode throughput, measured with `--bench 256` (greedy, batch 1):
+
+| GPU | model | quant | tok/s | weight GB/s | % of peak |
+|---|---|---|---|---|---|
+| RTX 3050 6 GB Laptop | TinyLlama-1.1B | f16 | *tbd* | | |
+| RTX 3050 6 GB Laptop | TinyLlama-1.1B | q8 | *tbd* | | |
+| RTX 3050 6 GB Laptop | TinyLlama-1.1B | q4 | *tbd* | | |
+
+Weights read per token for TinyLlama-1.1B: 2.07 GB (f16), 1.07 GB (q8), 0.55 GB (q4).
+
+## Correctness
+
+| check | how |
+|---|---|
+| model math vs HuggingFace | `tests/test_e2e.py` builds a random GQA Llama in `transformers`, converts it, and compares the logits at all 64 positions. Max relative error is about 8e-4 with 100% argmax agreement (f16, q8, q4, bf16). |
+| tokenizer vs HF | byte-identical token ids on Unicode, emoji, whitespace runs and byte-fallback cases |
+| CUDA kernels vs CPU | `tinf_tests`: gemv (3 formats × 7 shapes, including 32000×2048 and 333×11008), rmsnorm, swiglu, embed, argmax (with ties), RoPE + KV-cache writes, and attention up to 600 positions with GQA and head_dim 64/128/256 |
+| whole engine, GPU vs CPU | `tinyinfer --verify N` on any model |
+| CI | GitHub Actions: CPU build + unit tests + end-to-end vs `transformers`, and a CUDA 13 compile for sm_75/86/89 |
+
+The fp16 KV cache is the main source of the remaining 1e-3 difference from the fp32 HF
+reference. It is also used on the CPU reference path, so the GPU and CPU engines agree much more
+tightly than either agrees with HF.
+
+## Project layout
+
+```
+include/tinf/        public headers (engine, model file, tokenizer, sampler, quantization, CPU ops)
+src/cuda/            CUDA kernels + GPU engine (CUDA graphs)
+src/                 file loader, tokenizer, sampler, quantizer, CPU reference engine, CLI
+tools/convert_hf.py  HF safetensors -> .tinf (numpy only)
+tests/               CPU unit tests, CUDA kernel tests, end-to-end test vs transformers
+bench/               kernel micro-benchmarks
+docs/FORMAT.md       file format specification
+```
+
+## Roadmap
+
+- [ ] Batched prefill: a tiled tensor-core GEMM plus causal flash-attention, so prompts are processed in parallel
+- [ ] Split-K flash-decoding for long contexts (more blocks per head)
+- [ ] Byte-level BPE tokenizer (Llama-3, Qwen2, Mistral-Nemo) and Llama-3 RoPE scaling
+- [ ] INT8 KV cache
+- [ ] Fused QKV and gate/up GEMVs, and autotuning of rows per block
+- [ ] Continuous batching and an OpenAI-compatible HTTP server
+
+## License
+
+MIT, see [LICENSE](LICENSE).
