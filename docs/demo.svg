@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="385" viewBox="0 0 900 385" role="img" aria-label="tinyinfer benchmark on an RTX 3050 Laptop GPU: 235.2 tokens per second">
+<style>.t{font-family:'Cascadia Mono',Consolas,'SFMono-Regular',Menlo,'DejaVu Sans Mono',monospace;font-size:13px;white-space:pre}@keyframes c0{0%,3.88%{transform:translateX(0);opacity:1}12.94%{transform:translateX(419px);opacity:1}12.95%,97%{transform:translateX(419px);opacity:0}100%{transform:translateX(0);opacity:1}}@keyframes p0{0%,3.88%{opacity:0}3.89%,97%{opacity:1}100%{opacity:0}}.c0{animation:c0 15.4s infinite;animation-timing-function:steps(53,end)} .p0{animation:p0 15.4s infinite}@keyframes l1{0%,23.30%{opacity:0}23.31%,97%{opacity:1}100%{opacity:0}}@keyframes l2{0%,24.92%{opacity:0}24.93%,97%{opacity:1}100%{opacity:0}}@keyframes l3{0%,27.83%{opacity:0}27.84%,97%{opacity:1}100%{opacity:0}}@keyframes l4{0%,30.10%{opacity:0}30.11%,97%{opacity:1}100%{opacity:0}}@keyframes l5{0%,37.86%{opacity:0}37.87%,97%{opacity:1}100%{opacity:0}}@keyframes l6{0%,39.81%{opacity:0}39.82%,97%{opacity:1}100%{opacity:0}}@keyframes l7{0%,41.75%{opacity:0}41.76%,97%{opacity:1}100%{opacity:0}}@keyframes l8{0%,43.69%{opacity:0}43.70%,97%{opacity:1}100%{opacity:0}}@keyframes c9{0%,48.87%{transform:translateX(0);opacity:1}57.93%{transform:translateX(419px);opacity:1}57.94%,97%{transform:translateX(419px);opacity:0}100%{transform:translateX(0);opacity:1}}@keyframes p9{0%,48.87%{opacity:0}48.88%,97%{opacity:1}100%{opacity:0}}.c9{animation:c9 15.4s infinite;animation-timing-function:steps(53,end)} .p9{animation:p9 15.4s infinite}@keyframes l10{0%,66.99%{opacity:0}67.00%,97%{opacity:1}100%{opacity:0}}@keyframes l11{0%,67.77%{opacity:0}67.78%,97%{opacity:1}100%{opacity:0}}@keyframes l12{0%,68.54%{opacity:0}68.55%,97%{opacity:1}100%{opacity:0}}@keyframes l13{0%,69.32%{opacity:0}69.33%,97%{opacity:1}100%{opacity:0}}@keyframes l14{0%,70.10%{opacity:0}70.11%,97%{opacity:1}100%{opacity:0}}@keyframes l15{0%,70.87%{opacity:0}70.88%,97%{opacity:1}100%{opacity:0}}@keyframes l16{0%,74.11%{opacity:0}74.12%,97%{opacity:1}100%{opacity:0}}</style>
+<rect width="900" height="385" rx="10" fill="#0d1117" stroke="#30363d"/>
+<rect width="900" height="28" rx="10" fill="#161b22"/><rect y="18" width="900" height="10" fill="#161b22"/>
+<circle cx="18" cy="14" r="5.5" fill="#ff5f56"/>
+<circle cx="36" cy="14" r="5.5" fill="#ffbd2e"/>
+<circle cx="54" cy="14" r="5.5" fill="#27c93f"/>
+<text x="450.0" y="18" text-anchor="middle" fill="#8b949e" style="font-family:Segoe UI,Helvetica,Arial,sans-serif;font-size:12px">tinyinfer — RTX 3050 6GB Laptop GPU (recorded output)</text>
+<text class="t p0" xml:space="preserve" x="18" y="44" fill="#7ee787">PS&gt;</text>
+<text class="t p0" xml:space="preserve" x="49.3" y="44" fill="#e6edf3">tinyinfer.exe -m models/tinyllama-q4.tinf --bench 256</text>
+<rect class="c0" x="48.3" y="30" width="419" height="19" fill="#0d1117"/>
+<text class="t" xml:space="preserve" x="18" y="63" fill="#8b949e" style="animation:l1 15.4s infinite">tinyinfer 0.3.0 | tinyllama-q4.tinf | dim 2048, 22 layers, 32/4 heads, q4 (g64)</text>
+<text class="t" xml:space="preserve" x="18" y="82" fill="#8b949e" style="animation:l2 15.4s infinite">GPU: NVIDIA GeForce RTX 3050 6GB Laptop GPU (sm_86, 20 SMs, 6.0 GiB, ~168 GB/s)</text>
+<text class="t" xml:space="preserve" x="18" y="101" fill="#8b949e" style="animation:l3 15.4s infinite">engine cuda+graph loaded in 0.67 s | weights 649 MiB + KV cache 44 MiB | split-K GQA</text>
+<text class="t" xml:space="preserve" x="18" y="120" fill="#8b949e" style="animation:l4 15.4s infinite">gemv autotune (rows/warp): 2560x2048:2 2048x2048:1 11264x2048:1 2048x5632:2 32000x2048:1</text>
+<text class="t" xml:space="preserve" x="18" y="139" fill="#e6edf3" style="animation:l5 15.4s infinite">decode           : 256 tokens in 1.088 s</text>
+<text class="t" xml:space="preserve" x="18" y="158" fill="#3fb950" style="animation:l6 15.4s infinite">throughput       : 235.2 tok/s  (4.25 ms/token)</text>
+<text class="t" xml:space="preserve" x="18" y="177" fill="#3fb950" style="animation:l7 15.4s infinite">weight bandwidth : 129.3 GB/s  (77% of 168 GB/s peak)</text>
+<text class="t" xml:space="preserve" x="18" y="196" fill="#e6edf3" style="animation:l8 15.4s infinite"></text>
+<text class="t p9" xml:space="preserve" x="18" y="215" fill="#7ee787">PS&gt;</text>
+<text class="t p9" xml:space="preserve" x="49.3" y="215" fill="#e6edf3">tinyinfer.exe -m models/tinyllama-q4.tinf --verify 16</text>
+<rect class="c9" x="48.3" y="201" width="419" height="19" fill="#0d1117"/>
+<text class="t" xml:space="preserve" x="18" y="234" fill="#8b949e" style="animation:l10 15.4s infinite">  pos    token    max|diff|          rel   argmax</text>
+<text class="t" xml:space="preserve" x="18" y="253" fill="#8b949e" style="animation:l11 15.4s infinite">    0        1    1.699e-05    3.004e-06       ok</text>
+<text class="t" xml:space="preserve" x="18" y="272" fill="#8b949e" style="animation:l12 15.4s infinite">    1      450    7.085e-04    4.924e-05       ok</text>
+<text class="t" xml:space="preserve" x="18" y="291" fill="#8b949e" style="animation:l13 15.4s infinite">    2     4996    2.110e-03    1.361e-04       ok</text>
+<text class="t" xml:space="preserve" x="18" y="310" fill="#8b949e" style="animation:l14 15.4s infinite">  ...</text>
+<text class="t" xml:space="preserve" x="18" y="329" fill="#8b949e" style="animation:l15 15.4s infinite">   15     7698    1.601e-03    9.550e-05       ok</text>
+<text class="t" xml:space="preserve" x="18" y="348" fill="#3fb950" style="animation:l16 15.4s infinite">worst relative error 2.521e-04, argmax mismatches 0/16 -&gt; PASS   (GPU vs CPU reference)</text>
+</svg>

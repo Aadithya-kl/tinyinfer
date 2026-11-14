@@ -31,7 +31,7 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 
-const char* kVersion = "0.3.0";
+const char* kVersion = "0.3.1";
 
 struct Args {
     std::string model;

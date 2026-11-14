@@ -3,14 +3,32 @@
 **A from-scratch CUDA inference engine for Llama-family LLMs. Hand-written kernels, INT4/INT8 weight quantization, CUDA-graph decoding. No PyTorch, no cuBLAS, no dependencies.**
 
 [![CI](https://github.com/Aadithya-kl/tinyinfer/actions/workflows/ci.yml/badge.svg)](https://github.com/Aadithya-kl/tinyinfer/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Aadithya-kl/tinyinfer?color=76B900)](https://github.com/Aadithya-kl/tinyinfer/releases)
 ![CUDA](https://img.shields.io/badge/CUDA-12%20%7C%2013-76B900)
 ![C++17](https://img.shields.io/badge/C%2B%2B-17-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
-tinyinfer runs real chat models (TinyLlama-1.1B, Llama-2-7B, Vicuna, ...) on a laptop GPU. It is
-small enough to read in an afternoon: the engine is about 2,200 lines of C++/CUDA. Every kernel on the hot path
-is written by hand and checked against a CPU reference. That reference is in turn checked against
-HuggingFace `transformers`.
+<p align="center">
+  <img src="docs/demo.svg" alt="tinyinfer decoding at 235 tok/s on an RTX 3050 Laptop GPU and passing GPU-vs-CPU verification" width="900">
+  <br><sub>Real output recorded on an RTX 3050 6 GB Laptop GPU: <b>235 tok/s</b>, 77% of peak memory bandwidth, logits verified against the CPU reference.</sub>
+</p>
+
+tinyinfer runs chat models such as TinyLlama-1.1B, Llama-2-7B and Vicuna on a laptop GPU. It is
+small enough to read in an afternoon: the engine is about 2,200 lines of C++/CUDA. Every kernel on
+the hot path is written by hand and checked against a CPU reference, and that reference is in turn
+checked against HuggingFace `transformers`.
+
+### Try it in 3 commands (Windows, NVIDIA RTX 30-series or newer)
+
+Download `tinyinfer-windows-x64.zip` from [Releases](https://github.com/Aadithya-kl/tinyinfer/releases), unzip it, then:
+
+```powershell
+pip install numpy huggingface_hub
+python convert_hf.py --hf TinyLlama/TinyLlama-1.1B-Chat-v1.0 --quant q4 --out tinyllama-q4.tinf
+.\tinyinfer.exe -m tinyllama-q4.tinf
+```
+
+To build from source on other GPUs or on Linux, see [Quick start](#quick-start).
 
 ## Highlights
 
