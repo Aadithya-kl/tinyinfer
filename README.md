@@ -18,6 +18,8 @@ small enough to read in an afternoon: the engine is about 2,200 lines of C++/CUD
 the hot path is written by hand and checked against a CPU reference, and that reference is in turn
 checked against HuggingFace `transformers`.
 
+📝 **Read the story:** [How I built an LLM inference engine from scratch in CUDA](https://medium.com/@klaadithya/how-i-built-an-llm-inference-engine-from-scratch-in-cuda-235-tokens-s-on-a-6-gb-laptop-gpu-f5ac062950a6) (also on [dev.to](https://dev.to/ash_grey/how-i-built-an-llm-inference-engine-from-scratch-in-cuda-235-tokenss-on-a-6-gb-laptop-gpu-564p) and [Hashnode](https://aadithya.hashnode.dev/how-i-built-an-llm-inference-engine-from-scratch-in-cuda-235-tokens-s-on-a-6-gb-laptop-gpu)): the three optimization rounds from 200 to 235 tok/s, and the "optimization" that made things slower.
+
 ### Try it in 3 commands (Windows, NVIDIA RTX 30-series or newer)
 
 Download `tinyinfer-windows-x64.zip` from [Releases](https://github.com/Aadithya-kl/tinyinfer/releases), unzip it, then:
